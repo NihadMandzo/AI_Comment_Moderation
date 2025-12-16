@@ -30,6 +30,11 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
+If port 8000 is blocked on Windows, use:
+```powershell
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8010
+```
+
 ## Run (Linux/Mac)
 ```bash
 cd moderation_app

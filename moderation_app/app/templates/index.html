@@ -80,9 +80,7 @@
 
   <div id="toast" class="toast" aria-live="polite" aria-atomic="true"></div>
 
-  <script>
-    window.APP_LABELS = {{ labels | tojson }};
-  </script>
+  <script type="application/json" id="labelsJson">{{ labels | tojson }}</script>
   <script src="/static/app.js"></script>
 </body>
 </html>

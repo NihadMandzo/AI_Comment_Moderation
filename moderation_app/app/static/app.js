@@ -1,11 +1,28 @@
 (() => {
-  const LABELS = Array.isArray(window.APP_LABELS) ? window.APP_LABELS : [];
+  function readLabels() {
+    if (Array.isArray(window.APP_LABELS)) return window.APP_LABELS;
+    const el = document.getElementById('labelsJson');
+    if (!el) return [];
+    try {
+      const parsed = JSON.parse(el.textContent || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  const LABELS = readLabels();
 
   const toastEl = document.getElementById('toast');
   const modalEl = document.getElementById('reportModal');
+  const modBadModalEl = document.getElementById('moderateBadModal');
   const reportForm = document.getElementById('reportForm');
   const reportCommentId = document.getElementById('reportCommentId');
   const reportNote = document.getElementById('reportNote');
+
+  const modBadForm = document.getElementById('moderateBadForm');
+  const modBadCommentId = document.getElementById('moderateBadCommentId');
+  const modBadNote = document.getElementById('moderateBadNote');
 
   function toast(msg) {
     if (!toastEl) return;
@@ -29,6 +46,21 @@
   function closeModal() {
     if (!modalEl) return;
     modalEl.setAttribute('aria-hidden', 'true');
+  }
+
+  function openModBadModal(commentId) {
+    if (!modBadModalEl) return;
+    modBadCommentId.value = String(commentId);
+    if (modBadNote) modBadNote.value = '';
+    modBadModalEl.setAttribute('aria-hidden', 'false');
+    for (const cb of modBadModalEl.querySelectorAll('input[type="checkbox"][name="labels"]')) {
+      cb.checked = false;
+    }
+  }
+
+  function closeModBadModal() {
+    if (!modBadModalEl) return;
+    modBadModalEl.setAttribute('aria-hidden', 'true');
   }
 
   // Render score badges with intensity
@@ -64,6 +96,16 @@
     if (e.target.closest('[data-modal-close]')) {
       closeModal();
     }
+
+    const modBadBtn = e.target.closest('[data-moderate-bad]');
+    if (modBadBtn) {
+      openModBadModal(modBadBtn.getAttribute('data-comment-id'));
+      return;
+    }
+
+    if (e.target.closest('[data-moderate-close]')) {
+      closeModBadModal();
+    }
   });
 
   if (reportForm) {
@@ -95,6 +137,38 @@
 
         closeModal();
         toast('Report submitted');
+      } catch (_) {
+        toast('Network error');
+      }
+    });
+  }
+
+  if (modBadForm) {
+    modBadForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const id = Number(modBadCommentId.value);
+      const labels = [];
+      for (const cb of modBadForm.querySelectorAll('input[type="checkbox"][name="labels"]')) {
+        if (cb.checked) labels.push(cb.value);
+      }
+
+      const payload = { labels, note: (modBadNote && modBadNote.value) ? modBadNote.value : '' };
+
+      try {
+        const res = await fetch(`/moderation/${id}/bad`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          toast(err.error || 'Moderation update failed.');
+          return;
+        }
+
+        closeModBadModal();
+        toast('Marked bad and trained');
+        window.setTimeout(() => window.location.reload(), 400);
       } catch (_) {
         toast('Network error');
       }

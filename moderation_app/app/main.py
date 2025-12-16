@@ -15,6 +15,7 @@ from fastapi.templating import Jinja2Templates
 from .db import connect, init_db
 from .ml_baseline import LABELS, baseline_model
 from .ml_online import OnlineLearner
+from .rules import profanity_score, spam_score, threat_score
 
 
 HIDE_THRESHOLD = 0.65
@@ -85,6 +86,18 @@ def max_label(scores: Dict[str, float]) -> tuple[str, float]:
     return m_label, float(scores[m_label])
 
 
+def insert_report(comment_id: int, kind: str, selected: List[str], note: str) -> None:
+    kind_norm = (kind or "BAD").upper()
+    labels_json = json.dumps({l: 1 for l in selected}, ensure_ascii=False)
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO reports(comment_id, created_at, kind, labels_json, note) VALUES (?,?,?,?,?)",
+            (comment_id, now_iso(), kind_norm, labels_json, note),
+        )
+        conn.execute("UPDATE comments SET report_count = report_count + 1 WHERE id=?", (comment_id,))
+        conn.commit()
+
+
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
@@ -132,6 +145,16 @@ def create_comment(text: str = Form(...)) -> RedirectResponse:
     online = load_online()
     learned = online.predict_proba(t)
     final = combine_scores(baseline, learned)
+
+    # Hard, uni-project-safe rule overrides: obvious cases should work immediately.
+    rule_overrides = {
+        "profanity": float(profanity_score(t)),
+        "threat": float(threat_score(t)),
+        "spam": float(spam_score(t)),
+    }
+    for k, v in rule_overrides.items():
+        final[k] = float(max(final.get(k, 0.0), v))
+
     top_label, top_score = max_label(final)
 
     status = "HIDDEN" if top_score >= HIDE_THRESHOLD else "APPROVED"
@@ -176,17 +199,12 @@ async def report_comment(comment_id: int, request: Request) -> JSONResponse:
             return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
         text = row["text"]
 
-        conn.execute(
-            "INSERT INTO reports(comment_id, created_at, labels_json, note) VALUES (?,?,?,?)",
-            (comment_id, now_iso(), json.dumps({l: 1 for l in selected}), note),
-        )
-        conn.execute("UPDATE comments SET report_count = report_count + 1 WHERE id=?", (comment_id,))
-        conn.commit()
+    insert_report(comment_id=comment_id, kind="BAD", selected=selected, note=note)
 
     # Online update
     online = load_online()
     with _model_lock:
-        online.update(text, selected)
+        online.update(text, selected, kind="BAD")
         with connect() as conn:
             conn.execute("UPDATE training_state SET model_blob=? WHERE id=1", (online.dumps(),))
             conn.commit()
@@ -234,6 +252,59 @@ def approve(comment_id: int) -> RedirectResponse:
         conn.execute("UPDATE comments SET status='APPROVED' WHERE id=?", (comment_id,))
         conn.commit()
     return RedirectResponse(url="/moderation", status_code=303)
+
+
+@app.post("/moderation/{comment_id}/good")
+def mark_good(comment_id: int) -> RedirectResponse:
+    # Moderator says: this hidden comment is actually OK.
+    with connect() as conn:
+        row = conn.execute("SELECT id, text FROM comments WHERE id=?", (comment_id,)).fetchone()
+        if not row:
+            return RedirectResponse(url="/moderation", status_code=303)
+        text = row["text"]
+
+        conn.execute("UPDATE comments SET status='APPROVED' WHERE id=?", (comment_id,))
+        conn.commit()
+
+    insert_report(comment_id=comment_id, kind="GOOD", selected=[], note="moderation:good")
+
+    online = load_online()
+    with _model_lock:
+        online.update(text, [], kind="GOOD")
+        with connect() as conn:
+            conn.execute("UPDATE training_state SET model_blob=? WHERE id=1", (online.dumps(),))
+            conn.commit()
+
+    return RedirectResponse(url="/moderation", status_code=303)
+
+
+@app.post("/moderation/{comment_id}/bad")
+async def mark_bad(comment_id: int, request: Request) -> JSONResponse:
+    # Moderator says: this comment is bad, with multi-labels.
+    payload = await request.json()
+    labels = payload.get("labels") or []
+    note = (payload.get("note") or "").strip()
+    selected = [l for l in labels if l in LABELS]
+
+    with connect() as conn:
+        row = conn.execute("SELECT id, text FROM comments WHERE id=?", (comment_id,)).fetchone()
+        if not row:
+            return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+        text = row["text"]
+
+        conn.execute("UPDATE comments SET status='DELETED' WHERE id=?", (comment_id,))
+        conn.commit()
+
+    insert_report(comment_id=comment_id, kind="BAD", selected=selected, note=(note or "moderation:bad"))
+
+    online = load_online()
+    with _model_lock:
+        online.update(text, selected, kind="BAD")
+        with connect() as conn:
+            conn.execute("UPDATE training_state SET model_blob=? WHERE id=1", (online.dumps(),))
+            conn.commit()
+
+    return JSONResponse({"ok": True})
 
 
 @app.post("/moderation/{comment_id}/delete")

@@ -26,12 +26,10 @@
           <div class="comment__footer">
             <div class="badges" data-scores='{{ c.final | tojson }}'></div>
             <div class="row">
-              <form method="post" action="/moderation/{{ c.id }}/approve">
-                <button class="btn" type="submit">Approve</button>
+              <form method="post" action="/moderation/{{ c.id }}/good">
+                <button class="btn" type="submit">Good (Approve)</button>
               </form>
-              <form method="post" action="/moderation/{{ c.id }}/delete">
-                <button class="btn btn--danger" type="submit">Delete</button>
-              </form>
+              <button class="btn btn--danger" type="button" data-moderate-bad data-comment-id="{{ c.id }}">Bad (Delete + Train)</button>
             </div>
           </div>
         </article>
@@ -41,9 +39,45 @@
     </section>
   </main>
 
-  <script>
-    window.APP_LABELS = {{ labels | tojson }};
-  </script>
+  <div class="modal" id="moderateBadModal" aria-hidden="true">
+    <div class="modal__backdrop" data-moderate-close></div>
+    <div class="modal__panel" role="dialog" aria-modal="true" aria-labelledby="moderateBadTitle">
+      <header class="modal__header">
+        <h2 id="moderateBadTitle">Mark as bad</h2>
+        <button class="iconbtn" type="button" data-moderate-close aria-label="Close">×</button>
+      </header>
+
+      <form id="moderateBadForm" class="stack">
+        <input type="hidden" id="moderateBadCommentId" />
+
+        <div class="stack">
+          <div class="muted">Select one or more labels:</div>
+          <div class="grid">
+            {% for label in labels %}
+              <label class="check">
+                <input type="checkbox" name="labels" value="{{ label }}" />
+                <span>{{ label }}</span>
+              </label>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="stack">
+          <label class="label" for="moderateBadNote">Note (optional)</label>
+          <textarea id="moderateBadNote" rows="3" class="textarea" placeholder="Optional context..."></textarea>
+        </div>
+
+        <div class="row">
+          <button class="btn btn--danger" type="submit">Confirm bad</button>
+          <button class="btn btn--ghost" type="button" data-moderate-close>Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" aria-live="polite" aria-atomic="true"></div>
+
+  <script type="application/json" id="labelsJson">{{ labels | tojson }}</script>
   <script src="/static/app.js"></script>
 </body>
 </html>

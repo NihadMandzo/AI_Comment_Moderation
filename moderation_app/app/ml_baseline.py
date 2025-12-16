@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from typing import Dict
 
-from transformers import pipeline
+from transformers import AutoTokenizer, pipeline
 
 from .rules import profanity_score, spam_score, threat_score
 
@@ -21,16 +21,26 @@ class BaselineModel:
     def _load(self) -> None:
         # Load lazily so startup is fast-ish and failures don't crash the app.
         # 1) BERTić fine-tune for hate/offensive signal
+        hate_tok = AutoTokenizer.from_pretrained(
+            "classla/bcms-bertic-frenk-hate",
+            use_fast=False,
+        )
         self._pipe_hate = pipeline(
             task="text-classification",
             model="classla/bcms-bertic-frenk-hate",
+            tokenizer=hate_tok,
             top_k=None,
         )
 
         # 2) Unitary multilingual toxicity model with multi-headed labels
+        toxic_tok = AutoTokenizer.from_pretrained(
+            "unitary/multilingual-toxic-xlm-roberta",
+            use_fast=False,
+        )
         self._pipe_toxic = pipeline(
             task="text-classification",
             model="unitary/multilingual-toxic-xlm-roberta",
+            tokenizer=toxic_tok,
             top_k=None,
         )
 
