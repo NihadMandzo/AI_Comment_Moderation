@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Moderation</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <h1>Hidden comments</h1>
+      <a class="link" href="/">Public</a>
+    </header>
+
+    <section class="stack">
+      {% for c in comments %}
+        <article class="comment card">
+          <div class="comment__meta">
+            <div class="muted">#{{ c.id }} · {{ c.created_at }}</div>
+            <div class="muted">Reports: {{ c.report_count }}</div>
+          </div>
+
+          <p class="comment__text">{{ c.text }}</p>
+
+          <div class="comment__footer">
+            <div class="badges" data-scores='{{ c.final | tojson }}'></div>
+            <div class="row">
+              <form method="post" action="/moderation/{{ c.id }}/approve">
+                <button class="btn" type="submit">Approve</button>
+              </form>
+              <form method="post" action="/moderation/{{ c.id }}/delete">
+                <button class="btn btn--danger" type="submit">Delete</button>
+              </form>
+            </div>
+          </div>
+        </article>
+      {% else %}
+        <div class="muted">No hidden comments.</div>
+      {% endfor %}
+    </section>
+  </main>
+
+  <script>
+    window.APP_LABELS = {{ labels | tojson }};
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

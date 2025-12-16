@@ -1,0 +1,244 @@
+from __future__ import annotations
+
+import json
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from .db import connect, init_db
+from .ml_baseline import LABELS, baseline_model
+from .ml_online import OnlineLearner
+
+
+HIDE_THRESHOLD = 0.65
+BASELINE_WEIGHT = 0.70
+LEARNED_WEIGHT = 0.30
+
+# Simple in-memory rate limit for reports per IP
+REPORTS_PER_MINUTE = 10
+
+
+app = FastAPI(title="Moderation App")
+APP_DIR = Path(__file__).resolve().parent
+app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
+
+templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
+
+
+_model_lock = threading.Lock()
+_online: Optional[OnlineLearner] = None
+
+_rate_lock = threading.Lock()
+_rate_state: Dict[str, List[float]] = {}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def rate_limit_ok(ip: str) -> bool:
+    if not ip:
+        return True
+    cutoff = time.time() - 60
+    with _rate_lock:
+        times = [t for t in _rate_state.get(ip, []) if t >= cutoff]
+        if len(times) >= REPORTS_PER_MINUTE:
+            _rate_state[ip] = times
+            return False
+        times.append(time.time())
+        _rate_state[ip] = times
+        return True
+
+
+def load_online() -> OnlineLearner:
+    global _online
+    with _model_lock:
+        if _online is not None:
+            return _online
+        with connect() as conn:
+            row = conn.execute("SELECT model_blob FROM training_state WHERE id=1").fetchone()
+            blob = bytes(row["model_blob"]) if row else b"\x00"
+        _online = OnlineLearner.loads(blob)
+        return _online
+
+
+def combine_scores(baseline: Dict[str, float], learned: Dict[str, float]) -> Dict[str, float]:
+    final: Dict[str, float] = {}
+    for label in LABELS:
+        b = float(baseline.get(label, 0.0))
+        l = float(learned.get(label, 0.0))
+        final[label] = float(max(0.0, min(1.0, BASELINE_WEIGHT * b + LEARNED_WEIGHT * l)))
+    return final
+
+
+def max_label(scores: Dict[str, float]) -> tuple[str, float]:
+    if not scores:
+        return "", 0.0
+    m_label = max(scores, key=lambda k: scores[k])
+    return m_label, float(scores[m_label])
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    init_db()
+    load_online()
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request) -> HTMLResponse:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, text, created_at, final_labels_json, final_max_label, final_max_score, report_count "
+            "FROM comments WHERE status='APPROVED' ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+    comments = []
+    for r in rows:
+        final = json.loads(r["final_labels_json"]) if r["final_labels_json"] else {}
+        comments.append(
+            {
+                "id": r["id"],
+                "text": r["text"],
+                "created_at": r["created_at"],
+                "final": final,
+                "final_max_label": r["final_max_label"],
+                "final_max_score": r["final_max_score"],
+                "report_count": r["report_count"],
+            }
+        )
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "labels": LABELS,
+            "comments": comments,
+        },
+    )
+
+
+@app.post("/comments")
+def create_comment(text: str = Form(...)) -> RedirectResponse:
+    t = (text or "").strip()
+    if not t:
+        return RedirectResponse(url="/", status_code=303)
+
+    baseline = baseline_model.predict(t)
+    online = load_online()
+    learned = online.predict_proba(t)
+    final = combine_scores(baseline, learned)
+    top_label, top_score = max_label(final)
+
+    status = "HIDDEN" if top_score >= HIDE_THRESHOLD else "APPROVED"
+
+    print(f"[moderation] status={status} top={top_label}:{top_score:.3f} text={t[:80]!r}")
+
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO comments(text, created_at, status, baseline_labels_json, learned_labels_json, final_labels_json, "
+            "final_max_label, final_max_score, report_count) VALUES (?,?,?,?,?,?,?,?,0)",
+            (
+                t,
+                now_iso(),
+                status,
+                json.dumps(baseline, ensure_ascii=False),
+                json.dumps(learned, ensure_ascii=False),
+                json.dumps(final, ensure_ascii=False),
+                top_label,
+                top_score,
+            ),
+        )
+        conn.commit()
+
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/report/{comment_id}")
+async def report_comment(comment_id: int, request: Request) -> JSONResponse:
+    ip = request.client.host if request.client else ""
+    if not rate_limit_ok(ip):
+        return JSONResponse({"ok": False, "error": "rate_limited"}, status_code=429)
+
+    payload = await request.json()
+    labels = payload.get("labels") or []
+    note = (payload.get("note") or "").strip()
+
+    selected = [l for l in labels if l in LABELS]
+
+    with connect() as conn:
+        row = conn.execute("SELECT id, text FROM comments WHERE id=? AND status='APPROVED'", (comment_id,)).fetchone()
+        if not row:
+            return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+        text = row["text"]
+
+        conn.execute(
+            "INSERT INTO reports(comment_id, created_at, labels_json, note) VALUES (?,?,?,?)",
+            (comment_id, now_iso(), json.dumps({l: 1 for l in selected}), note),
+        )
+        conn.execute("UPDATE comments SET report_count = report_count + 1 WHERE id=?", (comment_id,))
+        conn.commit()
+
+    # Online update
+    online = load_online()
+    with _model_lock:
+        online.update(text, selected)
+        with connect() as conn:
+            conn.execute("UPDATE training_state SET model_blob=? WHERE id=1", (online.dumps(),))
+            conn.commit()
+
+    return JSONResponse({"ok": True})
+
+
+@app.get("/moderation", response_class=HTMLResponse)
+def moderation(request: Request) -> HTMLResponse:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, text, created_at, baseline_labels_json, learned_labels_json, final_labels_json, "
+            "final_max_label, final_max_score, report_count "
+            "FROM comments WHERE status='HIDDEN' ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+
+    items = []
+    for r in rows:
+        final = json.loads(r["final_labels_json"]) if r["final_labels_json"] else {}
+        items.append(
+            {
+                "id": r["id"],
+                "text": r["text"],
+                "created_at": r["created_at"],
+                "final": final,
+                "final_max_label": r["final_max_label"],
+                "final_max_score": r["final_max_score"],
+                "report_count": r["report_count"],
+            }
+        )
+
+    return templates.TemplateResponse(
+        "moderation.html",
+        {
+            "request": request,
+            "labels": LABELS,
+            "comments": items,
+        },
+    )
+
+
+@app.post("/moderation/{comment_id}/approve")
+def approve(comment_id: int) -> RedirectResponse:
+    with connect() as conn:
+        conn.execute("UPDATE comments SET status='APPROVED' WHERE id=?", (comment_id,))
+        conn.commit()
+    return RedirectResponse(url="/moderation", status_code=303)
+
+
+@app.post("/moderation/{comment_id}/delete")
+def delete(comment_id: int) -> RedirectResponse:
+    with connect() as conn:
+        conn.execute("UPDATE comments SET status='DELETED' WHERE id=?", (comment_id,))
+        conn.commit()
+    return RedirectResponse(url="/moderation", status_code=303)

@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Comments</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <h1>Public comments</h1>
+      <a class="link" href="/moderation">Moderation</a>
+    </header>
+
+    <section class="card">
+      <form method="post" action="/comments" class="stack">
+        <label class="label" for="text">Write a comment</label>
+        <textarea id="text" name="text" rows="4" class="textarea" required></textarea>
+        <button class="btn" type="submit">Submit</button>
+      </form>
+    </section>
+
+    <section class="stack">
+      {% for c in comments %}
+        <article class="comment card">
+          <div class="comment__meta">
+            <div class="muted">#{{ c.id }} · {{ c.created_at }}</div>
+            <div class="muted">Reports: {{ c.report_count }}</div>
+          </div>
+
+          <p class="comment__text">{{ c.text }}</p>
+
+          <div class="comment__footer">
+            <div class="badges" data-scores='{{ c.final | tojson }}'></div>
+            <button class="btn btn--ghost" type="button" data-report-button data-comment-id="{{ c.id }}">Report</button>
+          </div>
+        </article>
+      {% else %}
+        <div class="muted">No approved comments yet.</div>
+      {% endfor %}
+    </section>
+  </main>
+
+  <div class="modal" id="reportModal" aria-hidden="true">
+    <div class="modal__backdrop" data-modal-close></div>
+    <div class="modal__panel" role="dialog" aria-modal="true" aria-labelledby="reportTitle">
+      <header class="modal__header">
+        <h2 id="reportTitle">Report comment</h2>
+        <button class="iconbtn" type="button" data-modal-close aria-label="Close">×</button>
+      </header>
+
+      <form id="reportForm" class="stack">
+        <input type="hidden" id="reportCommentId" />
+
+        <div class="stack">
+          <div class="muted">Select one or more labels:</div>
+          <div class="grid">
+            {% for label in labels %}
+              <label class="check">
+                <input type="checkbox" name="labels" value="{{ label }}" />
+                <span>{{ label }}</span>
+              </label>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="stack">
+          <label class="label" for="reportNote">Note (optional)</label>
+          <textarea id="reportNote" rows="3" class="textarea" placeholder="Optional context..."></textarea>
+        </div>
+
+        <div class="row">
+          <button class="btn" type="submit">Submit report</button>
+          <button class="btn btn--ghost" type="button" data-modal-close>Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" aria-live="polite" aria-atomic="true"></div>
+
+  <script>
+    window.APP_LABELS = {{ labels | tojson }};
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
