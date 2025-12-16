@@ -18,9 +18,17 @@ from .ml_online import OnlineLearner
 from .rules import profanity_score, spam_score, threat_score
 
 
-HIDE_THRESHOLD = 0.65
 BASELINE_WEIGHT = 0.70
 LEARNED_WEIGHT = 0.30
+
+# Per-label decision thresholds (helps avoid false positives on mild "abuse" scores).
+LABEL_HIDE_THRESHOLDS: Dict[str, float] = {
+    "hate_speech": 0.75,
+    "abuse": 0.75,
+    "threat": 0.65,
+    "profanity": 0.65,
+    "spam": 0.65,
+}
 
 # Simple in-memory rate limit for reports per IP
 REPORTS_PER_MINUTE = 10
@@ -157,7 +165,11 @@ def create_comment(text: str = Form(...)) -> RedirectResponse:
 
     top_label, top_score = max_label(final)
 
-    status = "HIDDEN" if top_score >= HIDE_THRESHOLD else "APPROVED"
+    status = "APPROVED"
+    for label, thr in LABEL_HIDE_THRESHOLDS.items():
+        if float(final.get(label, 0.0)) >= float(thr):
+            status = "HIDDEN"
+            break
 
     print(f"[moderation] status={status} top={top_label}:{top_score:.3f} text={t[:80]!r}")
 
@@ -216,32 +228,37 @@ async def report_comment(comment_id: int, request: Request) -> JSONResponse:
 def moderation(request: Request) -> HTMLResponse:
     with connect() as conn:
         rows = conn.execute(
-            "SELECT id, text, created_at, baseline_labels_json, learned_labels_json, final_labels_json, "
-            "final_max_label, final_max_score, report_count "
-            "FROM comments WHERE status='HIDDEN' ORDER BY id DESC LIMIT 200"
+            "SELECT id, text, created_at, status, final_labels_json, final_max_label, final_max_score, report_count "
+            "FROM comments ORDER BY id DESC LIMIT 300"
         ).fetchall()
 
-    items = []
+    grouped: Dict[str, List[Dict]] = {"APPROVED": [], "HIDDEN": [], "DELETED": []}
+    all_items: List[Dict] = []
     for r in rows:
         final = json.loads(r["final_labels_json"]) if r["final_labels_json"] else {}
-        items.append(
-            {
-                "id": r["id"],
-                "text": r["text"],
-                "created_at": r["created_at"],
-                "final": final,
-                "final_max_label": r["final_max_label"],
-                "final_max_score": r["final_max_score"],
-                "report_count": r["report_count"],
-            }
-        )
+        item = {
+            "id": r["id"],
+            "text": r["text"],
+            "created_at": r["created_at"],
+            "status": r["status"],
+            "final": final,
+            "final_max_label": r["final_max_label"],
+            "final_max_score": r["final_max_score"],
+            "report_count": r["report_count"],
+        }
+        all_items.append(item)
+        if item["status"] in grouped:
+            grouped[item["status"]].append(item)
 
     return templates.TemplateResponse(
         "moderation.html",
         {
             "request": request,
             "labels": LABELS,
-            "comments": items,
+            "all_comments": all_items,
+            "approved_comments": grouped["APPROVED"],
+            "hidden_comments": grouped["HIDDEN"],
+            "deleted_comments": grouped["DELETED"],
         },
     )
 

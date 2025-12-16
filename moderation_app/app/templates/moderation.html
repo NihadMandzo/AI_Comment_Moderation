@@ -9,16 +9,17 @@
 <body>
   <main class="container">
     <header class="header">
-      <h1>Hidden comments</h1>
+      <h1>Moderation</h1>
       <a class="link" href="/">Public</a>
     </header>
 
     <section class="stack">
-      {% for c in comments %}
+      <h2 class="sectionTitle">All comments</h2>
+      {% for c in all_comments %}
         <article class="comment card">
           <div class="comment__meta">
             <div class="muted">#{{ c.id }} · {{ c.created_at }}</div>
-            <div class="muted">Reports: {{ c.report_count }}</div>
+            <div class="muted">Status: {{ c.status }} · Reports: {{ c.report_count }}</div>
           </div>
 
           <p class="comment__text">{{ c.text }}</p>
@@ -26,8 +27,34 @@
           <div class="comment__footer">
             <div class="badges" data-scores='{{ c.final | tojson }}'></div>
             <div class="row">
+              {% if c.status != 'DELETED' %}
+                <form method="post" action="/moderation/{{ c.id }}/good">
+                  <button class="btn" type="submit">Good (Approve)</button>
+                </form>
+                <button class="btn btn--danger" type="button" data-moderate-bad data-comment-id="{{ c.id }}">Bad (Delete + Train)</button>
+              {% endif %}
+            </div>
+          </div>
+        </article>
+      {% else %}
+        <div class="muted">No comments yet.</div>
+      {% endfor %}
+    </section>
+
+    <section class="stack" style="margin-top:18px">
+      <h2 class="sectionTitle">Hidden comments</h2>
+      {% for c in hidden_comments %}
+        <article class="comment card">
+          <div class="comment__meta">
+            <div class="muted">#{{ c.id }} · {{ c.created_at }}</div>
+            <div class="muted">Status: {{ c.status }} · Reports: {{ c.report_count }}</div>
+          </div>
+          <p class="comment__text">{{ c.text }}</p>
+          <div class="comment__footer">
+            <div class="badges" data-scores='{{ c.final | tojson }}'></div>
+            <div class="row">
               <form method="post" action="/moderation/{{ c.id }}/good">
-                <button class="btn" type="submit">Good (Approve)</button>
+                <button class="btn" type="submit">Good (Approve + Train)</button>
               </form>
               <button class="btn btn--danger" type="button" data-moderate-bad data-comment-id="{{ c.id }}">Bad (Delete + Train)</button>
             </div>
@@ -35,6 +62,24 @@
         </article>
       {% else %}
         <div class="muted">No hidden comments.</div>
+      {% endfor %}
+    </section>
+
+    <section class="stack" style="margin-top:18px">
+      <h2 class="sectionTitle">Deleted comments</h2>
+      {% for c in deleted_comments %}
+        <article class="comment card">
+          <div class="comment__meta">
+            <div class="muted">#{{ c.id }} · {{ c.created_at }}</div>
+            <div class="muted">Status: {{ c.status }} · Reports: {{ c.report_count }}</div>
+          </div>
+          <p class="comment__text">{{ c.text }}</p>
+          <div class="comment__footer">
+            <div class="badges" data-scores='{{ c.final | tojson }}'></div>
+          </div>
+        </article>
+      {% else %}
+        <div class="muted">No deleted comments.</div>
       {% endfor %}
     </section>
   </main>
