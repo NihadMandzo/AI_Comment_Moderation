@@ -3,7 +3,8 @@ from __future__ import annotations
 import threading
 from typing import Dict
 
-from transformers import AutoTokenizer, pipeline
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
 from .rules import profanity_score, spam_score, threat_score
 
@@ -16,7 +17,8 @@ class BaselineModel:
         self._lock = threading.Lock()
         self._loaded = False
         self._pipe_hate = None
-        self._pipe_toxic = None
+        self._toxic_tok = None
+        self._toxic_model = None
 
     def _load(self) -> None:
         # Load lazily so startup is fast-ish and failures don't crash the app.
@@ -33,16 +35,14 @@ class BaselineModel:
         )
 
         # 2) Unitary multilingual toxicity model with multi-headed labels
-        toxic_tok = AutoTokenizer.from_pretrained(
+        self._toxic_tok = AutoTokenizer.from_pretrained(
             "unitary/multilingual-toxic-xlm-roberta",
             use_fast=False,
         )
-        self._pipe_toxic = pipeline(
-            task="text-classification",
-            model="unitary/multilingual-toxic-xlm-roberta",
-            tokenizer=toxic_tok,
-            top_k=None,
+        self._toxic_model = AutoModelForSequenceClassification.from_pretrained(
+            "unitary/multilingual-toxic-xlm-roberta",
         )
+        self._toxic_model.eval()
 
         self._loaded = True
 
@@ -90,13 +90,21 @@ class BaselineModel:
             "identity_hate": 0.0,
         }
         try:
-            out = self._pipe_toxic(t)
-            items = out[0] if out and isinstance(out[0], list) else out
-            for item in items:
-                label = str(item.get("label", "")).lower()
-                score = float(item.get("score", 0.0))
+            assert self._toxic_tok is not None
+            assert self._toxic_model is not None
+
+            enc = self._toxic_tok(t, return_tensors="pt", truncation=True)
+            with torch.no_grad():
+                out = self._toxic_model(**enc)
+
+            logits = out.logits
+            probs = torch.sigmoid(logits).squeeze(0).tolist()
+
+            id2label = getattr(self._toxic_model.config, "id2label", {}) or {}
+            for i, p in enumerate(probs):
+                label = str(id2label.get(i, i)).lower()
                 if label in detox:
-                    detox[label] = max(detox[label], score)
+                    detox[label] = max(detox[label], float(p))
         except Exception as e:  # noqa: BLE001
             print(f"[baseline] WARNING: toxic inference failed: {e}")
 

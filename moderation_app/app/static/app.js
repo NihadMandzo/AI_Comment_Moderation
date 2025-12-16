@@ -24,6 +24,9 @@
   const modBadCommentId = document.getElementById('moderateBadCommentId');
   const modBadNote = document.getElementById('moderateBadNote');
 
+  const trainBtn = document.getElementById('trainModelBtn');
+  const trainForm = document.getElementById('trainModelForm');
+
   function toast(msg) {
     if (!toastEl) return;
     toastEl.textContent = msg;
@@ -173,6 +176,43 @@
         toast('Network error');
       }
     });
+  }
+
+  async function runTraining(e) {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+
+    if (!trainBtn) return;
+
+    const oldText = trainBtn.textContent;
+    trainBtn.disabled = true;
+    trainBtn.setAttribute('aria-busy', 'true');
+    toast('Training…');
+
+    try {
+      const res = await fetch('/moderation/train', {
+        method: 'POST',
+        headers: { 'Accept': 'application/json' }
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(data.error || 'Training failed.');
+        return;
+      }
+      toast(`Trained from ${data.reports_used ?? 0} reports · rescored ${data.comments_rescored ?? 0} comments`);
+      window.setTimeout(() => window.location.reload(), 500);
+    } catch (_) {
+      toast('Network error');
+    } finally {
+      trainBtn.disabled = false;
+      trainBtn.removeAttribute('aria-busy');
+      trainBtn.textContent = oldText;
+    }
+  }
+
+  if (trainForm) {
+    trainForm.addEventListener('submit', runTraining);
+  } else if (trainBtn) {
+    trainBtn.addEventListener('click', runTraining);
   }
 
   renderBadges();

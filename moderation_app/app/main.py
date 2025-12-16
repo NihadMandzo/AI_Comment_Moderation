@@ -106,6 +106,102 @@ def insert_report(comment_id: int, kind: str, selected: List[str], note: str) ->
         conn.commit()
 
 
+def retrain_from_all_reports() -> int:
+    """Rebuild the online learner from all stored reports.
+
+    This is useful after seeding data or when you want a clean training pass.
+    Returns the number of report rows used.
+    """
+    learner = OnlineLearner.fresh()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT r.kind, r.labels_json, c.text "
+            "FROM reports r JOIN comments c ON c.id=r.comment_id "
+            "ORDER BY r.id ASC"
+        ).fetchall()
+
+    used = 0
+    for r in rows:
+        kind = str(r["kind"] or "BAD")
+        labels_json = r["labels_json"] or "{}"
+        try:
+            d = json.loads(labels_json)
+            selected = [k for k, v in (d or {}).items() if v and k in LABELS]
+        except Exception:  # noqa: BLE001
+            selected = []
+        learner.update(str(r["text"] or ""), selected, kind=kind)
+        used += 1
+
+    with connect() as conn:
+        conn.execute("UPDATE training_state SET model_blob=? WHERE id=1", (learner.dumps(),))
+        conn.commit()
+
+    global _online
+    with _model_lock:
+        _online = learner
+    return used
+
+
+def rescore_existing_comments() -> int:
+    """Recompute baseline/learned/final scores for existing comments.
+
+    Keeps DELETED comments as DELETED (still used for training if they have reports).
+    Returns number of rescored rows.
+    """
+    learner = load_online()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, text, status FROM comments ORDER BY id ASC"
+        ).fetchall()
+
+    updated = 0
+    for r in rows:
+        cid = int(r["id"])
+        text = str(r["text"] or "")
+        status = str(r["status"] or "")
+
+        baseline = baseline_model.predict(text)
+        learned = learner.predict_proba(text)
+        final = combine_scores(baseline, learned)
+
+        # Hard rule overrides
+        rule_overrides = {
+            "profanity": float(profanity_score(text)),
+            "threat": float(threat_score(text)),
+            "spam": float(spam_score(text)),
+        }
+        for k, v in rule_overrides.items():
+            final[k] = float(max(final.get(k, 0.0), v))
+
+        top_label, top_score = max_label(final)
+
+        new_status = status
+        if status != "DELETED":
+            new_status = "APPROVED"
+            for label, thr in LABEL_HIDE_THRESHOLDS.items():
+                if float(final.get(label, 0.0)) >= float(thr):
+                    new_status = "HIDDEN"
+                    break
+
+        with connect() as conn:
+            conn.execute(
+                "UPDATE comments SET status=?, baseline_labels_json=?, learned_labels_json=?, final_labels_json=?, final_max_label=?, final_max_score=? WHERE id=?",
+                (
+                    new_status,
+                    json.dumps(baseline, ensure_ascii=False),
+                    json.dumps(learned, ensure_ascii=False),
+                    json.dumps(final, ensure_ascii=False),
+                    top_label,
+                    float(top_score),
+                    cid,
+                ),
+            )
+            conn.commit()
+        updated += 1
+
+    return updated
+
+
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
@@ -322,6 +418,19 @@ async def mark_bad(comment_id: int, request: Request) -> JSONResponse:
             conn.commit()
 
     return JSONResponse({"ok": True})
+
+
+@app.post("/moderation/train")
+def train_button(request: Request):
+    used = retrain_from_all_reports()
+    rescored = rescore_existing_comments()
+
+    accept = (request.headers.get("accept") or "").lower()
+    wants_html = "text/html" in accept
+    if wants_html:
+        return RedirectResponse(url="/moderation", status_code=303)
+
+    return JSONResponse({"ok": True, "reports_used": used, "comments_rescored": rescored})
 
 
 @app.post("/moderation/{comment_id}/delete")

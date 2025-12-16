@@ -29,7 +29,7 @@ _THREAT_RE = re.compile(
     r"spali\w*|"  # spalit ću
     r"silova\w*|"  # silovat
     r"bomba\w*|"
-    r"puca\w*|"
+    r"puca\w*"
     r")\b",
     re.IGNORECASE | re.UNICODE,
 )

@@ -10,7 +10,12 @@
   <main class="container">
     <header class="header">
       <h1>Moderation</h1>
-      <a class="link" href="/">Public</a>
+      <div class="row">
+        <form method="post" action="/moderation/train" id="trainModelForm">
+          <button class="btn btn--ghost" type="submit" id="trainModelBtn">Train model</button>
+        </form>
+        <a class="link" href="/">Public</a>
+      </div>
     </header>
 
     <section class="stack">

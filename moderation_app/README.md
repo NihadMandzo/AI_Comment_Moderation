@@ -32,7 +32,12 @@ uvicorn app.main:app --reload
 
 If port 8000 is blocked on Windows, use:
 ```powershell
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8010
+python -m uvicorn --app-dir . app.main:app --reload --host 127.0.0.1 --port 8010
+```
+
+If you see `ModuleNotFoundError: No module named 'app'` with `--reload` on Windows, use the included runner (it sets `PYTHONPATH` for the reload subprocess):
+```powershell
+./run.ps1
 ```
 
 ## Run (Linux/Mac)
@@ -45,8 +50,22 @@ uvicorn app.main:app --reload
 ```
 
 ## Open
-- Public: http://127.0.0.1:8000/
-- Moderation: http://127.0.0.1:8000/moderation
+- Public: http://127.0.0.1:8000/ (or http://127.0.0.1:8010/ if you used the alternate port)
+- Moderation: http://127.0.0.1:8000/moderation (or http://127.0.0.1:8010/moderation)
+
+## Seed + Train (optional)
+To quickly seed Bosnian good/bad examples and train the online model:
+```powershell
+cd moderation_app
+python scripts\seed_bosnian_dataset.py
+```
+
+You can also train from the UI:
+- Open the moderation page and click **Train model** (rebuilds the online learner from all stored reports, then rescoring existing comments so old false-positives get corrected).
+
+## Deleting vs training
+- **Bad (Delete + Train)** removes the comment from the public list (marks it DELETED) but keeps it in SQLite and uses it for training.
+- Training always uses any comment (approved/hidden/deleted) that has reports.
 
 ## Labels
 - `hate_speech`
