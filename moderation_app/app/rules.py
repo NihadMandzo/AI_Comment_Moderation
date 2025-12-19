@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+from .normalize import normalize_text
+
 
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 
@@ -15,21 +17,42 @@ _PROFANITY_RE = re.compile(
     r"p(i|í|i\u0301)?c\w*|pič\w*|pizd\w*|"
     r"sran\w*|govn\w*|"
     r"mater\w*|"
-    r"idiot\w*|kreten\w*"
     r")\b",
     re.IGNORECASE | re.UNICODE,
 )
 
-# Lightweight BCS threat heuristic.
-_THREAT_RE = re.compile(
+# Direct personal insults (abuse), kept separate from profanity.
+_ABUSE_RE = re.compile(
     r"\b("
-    r"ub(i|í|i\u0301)?(j|ću|cu|ces|ćeš|ces)?\w*|"  # ubiću, ubit cu, ubij...
+    r"idiot\w*|kreten\w*|budal\w*|deb(il|ila|ilu)\w*|"
+    r"glup\w*|retard\w*|imbecil\w*|moron\w*"
+    r")\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Threat rules are split into violent vs non-violent so actions can differ.
+_VIOLENT_THREAT_RE = re.compile(
+    r"\b("
+    r"ub(i|í|i\u0301)?(j|cu|ću|ces|ćeš|cete|ćete)?\w*|"  # ubij, ubiću...
     r"zakla\w*|zaklat\w*|"  # zaklat/zaklaću
     r"prebi\w*|razbi\w*|"  # prebiću, razbiću
     r"spali\w*|"  # spalit ću
     r"silova\w*|"  # silovat
-    r"bomba\w*|"
-    r"puca\w*"
+    r"bomba\w*|eksploz\w*|"
+    r"puca\w*|upuca\w*|"
+    r"noz\w*|pištolj\w*|pistolj\w*"
+    r")\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+_NONVIOLENT_THREAT_RE = re.compile(
+    r"\b("
+    r"prijav\w*\s+te|prijavit\w*\s+te|"
+    r"tuz\w*\s+te|tuž\w*\s+te|"
+    r"pozva\w*\s+policij\w*|zva\w*\s+policij\w*|"
+    r"banov\w*|banuj\w*|blokir\w*|"
+    r"otpust\w*|"
+    r"saznac\w*\s+ces|saznac\w*\s+ćeš"
     r")\b",
     re.IGNORECASE | re.UNICODE,
 )
@@ -37,7 +60,7 @@ _THREAT_RE = re.compile(
 
 def spam_score(text: str) -> float:
     """Heuristic spam score in [0, 1]."""
-    t = (text or "").strip()
+    t = normalize_text(text)
     if not t:
         return 0.0
 
@@ -68,7 +91,7 @@ def spam_score(text: str) -> float:
 
 def profanity_score(text: str) -> float:
     """Heuristic profanity score in [0, 1] for BCS languages."""
-    t = (text or "").strip()
+    t = normalize_text(text)
     if not t:
         return 0.0
 
@@ -84,11 +107,36 @@ def profanity_score(text: str) -> float:
     return 0.98
 
 
-def threat_score(text: str) -> float:
-    """Heuristic threat score in [0, 1] for BCS languages."""
-    t = (text or "").strip()
+def abuse_score(text: str) -> float:
+    """Heuristic abuse (personal insult) score in [0, 1] for BCS languages."""
+    t = normalize_text(text)
     if not t:
         return 0.0
-    if _THREAT_RE.search(t):
-        return 0.92
+    if _ABUSE_RE.search(t):
+        return 0.78
     return 0.0
+
+
+def violent_threat_score(text: str) -> float:
+    """Heuristic violent threat score in [0, 1] for BCS languages."""
+    t = normalize_text(text)
+    if not t:
+        return 0.0
+    if _VIOLENT_THREAT_RE.search(t):
+        return 0.95
+    return 0.0
+
+
+def nonviolent_threat_score(text: str) -> float:
+    """Heuristic non-violent threat score in [0, 1] for BCS languages."""
+    t = normalize_text(text)
+    if not t:
+        return 0.0
+    if _NONVIOLENT_THREAT_RE.search(t):
+        return 0.65
+    return 0.0
+
+
+def threat_score(text: str) -> float:
+    """Backwards-compatible: max of violent + non-violent threats."""
+    return float(max(violent_threat_score(text), nonviolent_threat_score(text)))

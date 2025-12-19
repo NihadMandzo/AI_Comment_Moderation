@@ -6,7 +6,7 @@ from typing import Dict
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
-from .rules import profanity_score, spam_score, threat_score
+from .rules import abuse_score, profanity_score, spam_score, threat_score
 
 
 LABELS = ["hate_speech", "abuse", "threat", "profanity", "spam"]
@@ -111,13 +111,10 @@ class BaselineModel:
         hate_speech = max(bertic_hate, detox["identity_hate"])
         threat = max(detox["threat"], float(threat_score(t)))
         profanity = max(detox["obscene"], float(profanity_score(t)))
-        abuse = max(
-            detox["toxic"],
-            detox["severe_toxic"],
-            detox["insult"],
-            detox["obscene"],
-            float(profanity_score(t)),
-        )
+        # Keep label semantics clean:
+        # - profanity: vulgar language
+        # - abuse: personal insult / harassment signal (not profanity)
+        abuse = max(detox["insult"], detox["toxic"], detox["severe_toxic"], float(abuse_score(t)))
         spam = float(spam_score(t))
 
         return {
