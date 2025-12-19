@@ -17,8 +17,9 @@ def _new_vectorizer() -> HashingVectorizer:
         n_features=2**18,
         alternate_sign=False,
         norm="l2",
-        lowercase=True,
-        ngram_range=(1, 2),
+        lowercase=False,
+        analyzer="char_wb",
+        ngram_range=(3, 5),
     )
 
 
@@ -50,9 +51,22 @@ class OnlineLearner:
         return out
 
     def update(self, text: str, selected_labels: Iterable[str], kind: str = "BAD") -> None:
+    
+        self.update_weighted(text, selected_labels, kind=kind, weight=1.0)
+
+    def update_weighted(
+        self,
+        text: str,
+        selected_labels: Iterable[str],
+        *,
+        kind: str = "BAD",
+        weight: float = 1.0,
+    ) -> None:
         kind_norm = (kind or "BAD").upper()
         selected = set(selected_labels)
         x = self.vectorizer.transform([text])
+        w = float(max(0.0, weight))
+        sample_weight = np.array([w], dtype=float)
 
         if kind_norm == "GOOD":
             y = {label: 0 for label in LABELS}
@@ -63,12 +77,17 @@ class OnlineLearner:
         # partial_fit needs classes on the first call
         if not self.is_initialized:
             for label, clf in self.classifiers.items():
-                clf.partial_fit(x, np.array([y[label]]), classes=np.array([0, 1]))
+                clf.partial_fit(
+                    x,
+                    np.array([y[label]]),
+                    classes=np.array([0, 1]),
+                    sample_weight=sample_weight,
+                )
             self.is_initialized = True
             return
 
         for label, clf in self.classifiers.items():
-            clf.partial_fit(x, np.array([y[label]]))
+            clf.partial_fit(x, np.array([y[label]]), sample_weight=sample_weight)
 
     def dumps(self) -> bytes:
         payload = {

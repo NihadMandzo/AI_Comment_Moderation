@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import secrets
 import threading
 import time
 from datetime import datetime, timezone
@@ -15,23 +18,37 @@ from fastapi.templating import Jinja2Templates
 from .db import connect, init_db
 from .ml_baseline import LABELS, baseline_model
 from .ml_online import OnlineLearner
-from .rules import profanity_score, spam_score, threat_score
+from .normalize import normalize_text, two_channel
+from .rules import nonviolent_threat_score, profanity_score, spam_score, threat_score, violent_threat_score
 
 
-BASELINE_WEIGHT = 0.70
-LEARNED_WEIGHT = 0.30
+# 3-zone moderation: ALLOW / PENDING_REVIEW / DELETE
+ALLOW_MAX = 0.35
+PENDING_MIN = 0.35
+DELETE_MIN_DEFAULT = 0.80
 
-# Per-label decision thresholds (helps avoid false positives on mild "abuse" scores).
-LABEL_HIDE_THRESHOLDS: Dict[str, float] = {
-    "hate_speech": 0.75,
-    "abuse": 0.75,
-    "threat": 0.65,
-    "profanity": 0.65,
-    "spam": 0.65,
+# Conservative deletes for weaker categories.
+DELETE_MIN_BY_LABEL: Dict[str, float] = {
+    "spam": 0.95,
+    "profanity": 0.95,
+    "abuse": 0.90,
 }
+
+STATUS_APPROVED = "APPROVED"
+STATUS_PENDING = "PENDING_REVIEW"
+STATUS_DELETED = "DELETED"
+
+# True hard rule: violent threats get deleted immediately.
+VIOLENT_THREAT_DELETE_MIN = 0.80
 
 # Simple in-memory rate limit for reports per IP
 REPORTS_PER_MINUTE = 10
+
+# Weak-label learning gate
+CONSENSUS_MIN_REPORTERS = 2
+
+# Server-side salt file to hash reporters without storing raw IP/UA.
+SALT_ENV_VAR = "MODERATION_SALT"
 
 
 app = FastAPI(title="Moderation App")
@@ -46,6 +63,42 @@ _online: Optional[OnlineLearner] = None
 
 _rate_lock = threading.Lock()
 _rate_state: Dict[str, List[float]] = {}
+
+
+def _server_salt_path() -> Path:
+    return APP_DIR / "_server_salt.txt"
+
+
+def _get_server_salt() -> str:
+    env = (os.environ.get(SALT_ENV_VAR) or "").strip()
+    if env:
+        return env
+
+    p = _server_salt_path()
+    try:
+        if p.exists():
+            return p.read_text(encoding="utf-8").strip()
+        salt = secrets.token_hex(32)
+        p.write_text(salt, encoding="utf-8")
+        return salt
+    except Exception:  # noqa: BLE001
+        # If filesystem is read-only, still provide a best-effort salt (non-persistent).
+        return secrets.token_hex(32)
+
+
+def _reporter_hash(ip: str, user_agent: str, ts: Optional[datetime] = None) -> str:
+    """Hash IP+UA with monthly rotation, so we can count 'independent reporters'."""
+    ip = (ip or "").strip()
+    ua = (user_agent or "").strip()
+    if not ip:
+        return ""
+
+    dt = ts or datetime.now(timezone.utc)
+    month = dt.strftime("%Y-%m")
+
+    base = _get_server_salt()
+    rot = hashlib.sha256(f"{base}:{month}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{rot}:{ip}:{ua}".encode("utf-8")).hexdigest()
 
 
 def now_iso() -> str:
@@ -77,13 +130,31 @@ def load_online() -> OnlineLearner:
         _online = OnlineLearner.loads(blob)
         return _online
 
+def _training_count() -> int:
+    with connect() as conn:
+        row = conn.execute("SELECT COUNT(1) AS n FROM reports WHERE used_for_training=1").fetchone()
+        return int(row["n"] if row else 0)
 
-def combine_scores(baseline: Dict[str, float], learned: Dict[str, float]) -> Dict[str, float]:
+
+def _learned_weight(training_count: int) -> float:
+    # Increase learned influence as we accumulate gold/consensus labels.
+    # Caps at 0.5.
+    return float(min(0.5, (float(training_count) / 2000.0) * 0.5))
+
+
+def combine_scores(
+    baseline: Dict[str, float],
+    learned: Dict[str, float],
+    *,
+    training_count: int,
+) -> Dict[str, float]:
     final: Dict[str, float] = {}
+    lw = _learned_weight(training_count)
+    bw = 1.0 - lw
     for label in LABELS:
         b = float(baseline.get(label, 0.0))
         l = float(learned.get(label, 0.0))
-        final[label] = float(max(0.0, min(1.0, BASELINE_WEIGHT * b + LEARNED_WEIGHT * l)))
+        final[label] = float(max(0.0, min(1.0, bw * b + lw * l)))
     return final
 
 
@@ -94,16 +165,113 @@ def max_label(scores: Dict[str, float]) -> tuple[str, float]:
     return m_label, float(scores[m_label])
 
 
-def insert_report(comment_id: int, kind: str, selected: List[str], note: str) -> None:
+def insert_report(
+    *,
+    comment_id: int,
+    kind: str,
+    selected: List[str],
+    note: str,
+    reporter_hash: str,
+    confidence: float,
+    used_for_training: int,
+) -> None:
     kind_norm = (kind or "BAD").upper()
     labels_json = json.dumps({l: 1 for l in selected}, ensure_ascii=False)
     with connect() as conn:
         conn.execute(
-            "INSERT INTO reports(comment_id, created_at, kind, labels_json, note) VALUES (?,?,?,?,?)",
-            (comment_id, now_iso(), kind_norm, labels_json, note),
+            "INSERT INTO reports(comment_id, created_at, kind, labels_json, reporter_hash, confidence, used_for_training, note) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (
+                comment_id,
+                now_iso(),
+                kind_norm,
+                labels_json,
+                (reporter_hash or ""),
+                float(confidence),
+                int(used_for_training),
+                note,
+            ),
         )
         conn.execute("UPDATE comments SET report_count = report_count + 1 WHERE id=?", (comment_id,))
         conn.commit()
+
+
+def _decide_status(scores: Dict[str, float], *, violent_threat: float) -> str:
+    if float(violent_threat) >= float(VIOLENT_THREAT_DELETE_MIN):
+        return STATUS_DELETED
+
+    # Delete zone (per label)
+    for label in LABELS:
+        s = float(scores.get(label, 0.0))
+        delete_min = float(DELETE_MIN_BY_LABEL.get(label, DELETE_MIN_DEFAULT))
+        if s >= delete_min:
+            return STATUS_DELETED
+
+    # Pending zone
+    for label in LABELS:
+        s = float(scores.get(label, 0.0))
+        if s >= PENDING_MIN:
+            return STATUS_PENDING
+
+    return STATUS_APPROVED
+
+
+def _maybe_train_from_consensus(
+    *,
+    comment_id: int,
+    text_norm: str,
+    kind: str,
+    selected: List[str],
+) -> bool:
+    """Train from user reports only once when a new label-set hits consensus."""
+    kind_norm = (kind or "BAD").upper()
+    if kind_norm != "BAD":
+        return False
+
+    labels_json = json.dumps({l: 1 for l in selected}, ensure_ascii=False)
+    with connect() as conn:
+        already = conn.execute(
+            "SELECT COUNT(DISTINCT reporter_hash) AS n "
+            "FROM reports WHERE comment_id=? AND kind=? AND labels_json=? AND used_for_training=1 AND reporter_hash!=''",
+            (comment_id, kind_norm, labels_json),
+        ).fetchone()
+        already_n = int(already["n"] if already else 0)
+        if already_n >= CONSENSUS_MIN_REPORTERS:
+            return False
+
+        total = conn.execute(
+            "SELECT COUNT(DISTINCT reporter_hash) AS n "
+            "FROM reports WHERE comment_id=? AND kind=? AND labels_json=? AND reporter_hash!=''",
+            (comment_id, kind_norm, labels_json),
+        ).fetchone()
+        total_n = int(total["n"] if total else 0)
+        if total_n < CONSENSUS_MIN_REPORTERS:
+            return False
+
+        conn.execute(
+            "UPDATE reports SET used_for_training=1 "
+            "WHERE comment_id=? AND kind=? AND labels_json=? AND used_for_training=0",
+            (comment_id, kind_norm, labels_json),
+        )
+        conn.commit()
+
+        # Weight = sum(max confidence per reporter) to avoid spammy repeats.
+        rows = conn.execute(
+            "SELECT reporter_hash, MAX(confidence) AS c "
+            "FROM reports WHERE comment_id=? AND kind=? AND labels_json=? AND reporter_hash!='' "
+            "GROUP BY reporter_hash",
+            (comment_id, kind_norm, labels_json),
+        ).fetchall()
+        weight = float(sum(float(r["c"] or 0.0) for r in rows))
+        weight = float(max(0.1, min(2.0, weight)))
+
+    online = load_online()
+    with _model_lock:
+        online.update_weighted(text_norm, selected, kind=kind_norm, weight=weight)
+        with connect() as conn:
+            conn.execute("UPDATE training_state SET model_blob=? WHERE id=1", (online.dumps(),))
+            conn.commit()
+    return True
 
 
 def retrain_from_all_reports() -> int:
@@ -115,8 +283,9 @@ def retrain_from_all_reports() -> int:
     learner = OnlineLearner.fresh()
     with connect() as conn:
         rows = conn.execute(
-            "SELECT r.kind, r.labels_json, c.text "
+            "SELECT r.kind, r.labels_json, r.confidence, c.text "
             "FROM reports r JOIN comments c ON c.id=r.comment_id "
+            "WHERE r.used_for_training=1 "
             "ORDER BY r.id ASC"
         ).fetchall()
 
@@ -124,12 +293,14 @@ def retrain_from_all_reports() -> int:
     for r in rows:
         kind = str(r["kind"] or "BAD")
         labels_json = r["labels_json"] or "{}"
+        conf = float(r["confidence"] or 1.0)
         try:
             d = json.loads(labels_json)
             selected = [k for k, v in (d or {}).items() if v and k in LABELS]
         except Exception:  # noqa: BLE001
             selected = []
-        learner.update(str(r["text"] or ""), selected, kind=kind)
+        t_norm = normalize_text(str(r["text"] or ""))
+        learner.update_weighted(t_norm, selected, kind=kind, weight=conf)
         used += 1
 
     with connect() as conn:
@@ -149,6 +320,7 @@ def rescore_existing_comments() -> int:
     Returns number of rescored rows.
     """
     learner = load_online()
+    training_count = _training_count()
     with connect() as conn:
         rows = conn.execute(
             "SELECT id, text, status FROM comments ORDER BY id ASC"
@@ -160,15 +332,20 @@ def rescore_existing_comments() -> int:
         text = str(r["text"] or "")
         status = str(r["status"] or "")
 
-        baseline = baseline_model.predict(text)
-        learned = learner.predict_proba(text)
-        final = combine_scores(baseline, learned)
+        ch = two_channel(text)
+
+        baseline = baseline_model.predict(ch.raw)
+        learned = learner.predict_proba(ch.norm)
+        final = combine_scores(baseline, learned, training_count=training_count)
 
         # Hard rule overrides
+        vth = float(violent_threat_score(ch.norm))
+        nth = float(nonviolent_threat_score(ch.norm))
+
         rule_overrides = {
-            "profanity": float(profanity_score(text)),
-            "threat": float(threat_score(text)),
-            "spam": float(spam_score(text)),
+            "profanity": float(profanity_score(ch.norm)),
+            "threat": float(max(vth, nth, float(threat_score(ch.norm)))),
+            "spam": float(spam_score(ch.norm)),
         }
         for k, v in rule_overrides.items():
             final[k] = float(max(final.get(k, 0.0), v))
@@ -176,12 +353,12 @@ def rescore_existing_comments() -> int:
         top_label, top_score = max_label(final)
 
         new_status = status
-        if status != "DELETED":
-            new_status = "APPROVED"
-            for label, thr in LABEL_HIDE_THRESHOLDS.items():
-                if float(final.get(label, 0.0)) >= float(thr):
-                    new_status = "HIDDEN"
-                    break
+        if status != STATUS_DELETED:
+            new_status = _decide_status(final, violent_threat=vth)
+
+        # Migrate old HIDDEN into the new pending status.
+        if new_status == "HIDDEN":
+            new_status = STATUS_PENDING
 
         with connect() as conn:
             conn.execute(
@@ -213,7 +390,8 @@ def index(request: Request) -> HTMLResponse:
     with connect() as conn:
         rows = conn.execute(
             "SELECT id, text, created_at, final_labels_json, final_max_label, final_max_score, report_count "
-            "FROM comments WHERE status='APPROVED' ORDER BY id DESC LIMIT 200"
+            "FROM comments WHERE status=? ORDER BY id DESC LIMIT 200",
+            (STATUS_APPROVED,),
         ).fetchall()
     comments = []
     for r in rows:
@@ -245,27 +423,28 @@ def create_comment(text: str = Form(...)) -> RedirectResponse:
     if not t:
         return RedirectResponse(url="/", status_code=303)
 
-    baseline = baseline_model.predict(t)
+    ch = two_channel(t)
+    training_count = _training_count()
+
+    baseline = baseline_model.predict(ch.raw)
     online = load_online()
-    learned = online.predict_proba(t)
-    final = combine_scores(baseline, learned)
+    learned = online.predict_proba(ch.norm)
+    final = combine_scores(baseline, learned, training_count=training_count)
 
     # Hard, uni-project-safe rule overrides: obvious cases should work immediately.
+    vth = float(violent_threat_score(ch.norm))
+    nth = float(nonviolent_threat_score(ch.norm))
     rule_overrides = {
-        "profanity": float(profanity_score(t)),
-        "threat": float(threat_score(t)),
-        "spam": float(spam_score(t)),
+        "profanity": float(profanity_score(ch.norm)),
+        "threat": float(max(vth, nth, float(threat_score(ch.norm)))),
+        "spam": float(spam_score(ch.norm)),
     }
     for k, v in rule_overrides.items():
         final[k] = float(max(final.get(k, 0.0), v))
 
     top_label, top_score = max_label(final)
 
-    status = "APPROVED"
-    for label, thr in LABEL_HIDE_THRESHOLDS.items():
-        if float(final.get(label, 0.0)) >= float(thr):
-            status = "HIDDEN"
-            break
+    status = _decide_status(final, violent_threat=vth)
 
     print(f"[moderation] status={status} top={top_label}:{top_score:.3f} text={t[:80]!r}")
 
@@ -302,22 +481,35 @@ async def report_comment(comment_id: int, request: Request) -> JSONResponse:
     selected = [l for l in labels if l in LABELS]
 
     with connect() as conn:
-        row = conn.execute("SELECT id, text FROM comments WHERE id=? AND status='APPROVED'", (comment_id,)).fetchone()
+        row = conn.execute(
+            "SELECT id, text FROM comments WHERE id=? AND status=?",
+            (comment_id, STATUS_APPROVED),
+        ).fetchone()
         if not row:
             return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
         text = row["text"]
 
-    insert_report(comment_id=comment_id, kind="BAD", selected=selected, note=note)
+    ua = request.headers.get("user-agent") or ""
+    rep_hash = _reporter_hash(ip, ua)
 
-    # Online update
-    online = load_online()
-    with _model_lock:
-        online.update(text, selected, kind="BAD")
-        with connect() as conn:
-            conn.execute("UPDATE training_state SET model_blob=? WHERE id=1", (online.dumps(),))
-            conn.commit()
+    insert_report(
+        comment_id=comment_id,
+        kind="BAD",
+        selected=selected,
+        note=note,
+        reporter_hash=rep_hash,
+        confidence=0.3,
+        used_for_training=0,
+    )
 
-    return JSONResponse({"ok": True})
+    # Weak labels: train only on consensus.
+    trained = _maybe_train_from_consensus(
+        comment_id=comment_id,
+        text_norm=normalize_text(str(text or "")),
+        kind="BAD",
+        selected=selected,
+    )
+    return JSONResponse({"ok": True, "trained": bool(trained)})
 
 
 @app.get("/moderation", response_class=HTMLResponse)
@@ -328,7 +520,12 @@ def moderation(request: Request) -> HTMLResponse:
             "FROM comments ORDER BY id DESC LIMIT 300"
         ).fetchall()
 
-    grouped: Dict[str, List[Dict]] = {"APPROVED": [], "HIDDEN": [], "DELETED": []}
+    grouped: Dict[str, List[Dict]] = {
+        STATUS_APPROVED: [],
+        STATUS_PENDING: [],
+        "HIDDEN": [],
+        STATUS_DELETED: [],
+    }
     all_items: List[Dict] = []
     for r in rows:
         final = json.loads(r["final_labels_json"]) if r["final_labels_json"] else {}
@@ -342,6 +539,11 @@ def moderation(request: Request) -> HTMLResponse:
             "final_max_score": r["final_max_score"],
             "report_count": r["report_count"],
         }
+
+        # Display legacy HIDDEN as PENDING_REVIEW.
+        if item["status"] == "HIDDEN":
+            item["status"] = STATUS_PENDING
+
         all_items.append(item)
         if item["status"] in grouped:
             grouped[item["status"]].append(item)
@@ -352,9 +554,9 @@ def moderation(request: Request) -> HTMLResponse:
             "request": request,
             "labels": LABELS,
             "all_comments": all_items,
-            "approved_comments": grouped["APPROVED"],
-            "hidden_comments": grouped["HIDDEN"],
-            "deleted_comments": grouped["DELETED"],
+            "approved_comments": grouped[STATUS_APPROVED],
+            "pending_comments": grouped[STATUS_PENDING],
+            "deleted_comments": grouped[STATUS_DELETED],
         },
     )
 
@@ -362,28 +564,36 @@ def moderation(request: Request) -> HTMLResponse:
 @app.post("/moderation/{comment_id}/approve")
 def approve(comment_id: int) -> RedirectResponse:
     with connect() as conn:
-        conn.execute("UPDATE comments SET status='APPROVED' WHERE id=?", (comment_id,))
+        conn.execute("UPDATE comments SET status=? WHERE id=?", (STATUS_APPROVED, comment_id))
         conn.commit()
     return RedirectResponse(url="/moderation", status_code=303)
 
 
 @app.post("/moderation/{comment_id}/good")
 def mark_good(comment_id: int) -> RedirectResponse:
-    # Moderator says: this hidden comment is actually OK.
+    # Moderator says: this comment is OK.
     with connect() as conn:
         row = conn.execute("SELECT id, text FROM comments WHERE id=?", (comment_id,)).fetchone()
         if not row:
             return RedirectResponse(url="/moderation", status_code=303)
         text = row["text"]
 
-        conn.execute("UPDATE comments SET status='APPROVED' WHERE id=?", (comment_id,))
+        conn.execute("UPDATE comments SET status=? WHERE id=?", (STATUS_APPROVED, comment_id))
         conn.commit()
 
-    insert_report(comment_id=comment_id, kind="GOOD", selected=[], note="moderation:good")
+    insert_report(
+        comment_id=comment_id,
+        kind="GOOD",
+        selected=[],
+        note="moderation:good",
+        reporter_hash="moderator",
+        confidence=1.0,
+        used_for_training=1,
+    )
 
     online = load_online()
     with _model_lock:
-        online.update(text, [], kind="GOOD")
+        online.update_weighted(normalize_text(str(text or "")), [], kind="GOOD", weight=1.0)
         with connect() as conn:
             conn.execute("UPDATE training_state SET model_blob=? WHERE id=1", (online.dumps(),))
             conn.commit()
@@ -405,14 +615,22 @@ async def mark_bad(comment_id: int, request: Request) -> JSONResponse:
             return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
         text = row["text"]
 
-        conn.execute("UPDATE comments SET status='DELETED' WHERE id=?", (comment_id,))
+        conn.execute("UPDATE comments SET status=? WHERE id=?", (STATUS_DELETED, comment_id))
         conn.commit()
 
-    insert_report(comment_id=comment_id, kind="BAD", selected=selected, note=(note or "moderation:bad"))
+    insert_report(
+        comment_id=comment_id,
+        kind="BAD",
+        selected=selected,
+        note=(note or "moderation:bad"),
+        reporter_hash="moderator",
+        confidence=1.0,
+        used_for_training=1,
+    )
 
     online = load_online()
     with _model_lock:
-        online.update(text, selected, kind="BAD")
+        online.update_weighted(normalize_text(str(text or "")), selected, kind="BAD", weight=1.0)
         with connect() as conn:
             conn.execute("UPDATE training_state SET model_blob=? WHERE id=1", (online.dumps(),))
             conn.commit()
@@ -436,6 +654,6 @@ def train_button(request: Request):
 @app.post("/moderation/{comment_id}/delete")
 def delete(comment_id: int) -> RedirectResponse:
     with connect() as conn:
-        conn.execute("UPDATE comments SET status='DELETED' WHERE id=?", (comment_id,))
+        conn.execute("UPDATE comments SET status=? WHERE id=?", (STATUS_DELETED, comment_id))
         conn.commit()
     return RedirectResponse(url="/moderation", status_code=303)

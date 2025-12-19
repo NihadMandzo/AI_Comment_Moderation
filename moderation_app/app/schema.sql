@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS reports (
   created_at TEXT NOT NULL,
   kind TEXT NOT NULL DEFAULT 'BAD',
   labels_json TEXT NOT NULL,
+  reporter_hash TEXT,
+  confidence REAL NOT NULL DEFAULT 0.3,
+  used_for_training INTEGER NOT NULL DEFAULT 0,
   note TEXT,
   FOREIGN KEY(comment_id) REFERENCES comments(id)
 );

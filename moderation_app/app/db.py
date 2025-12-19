@@ -26,4 +26,13 @@ def init_db() -> None:
         if "kind" not in cols:
             conn.execute("ALTER TABLE reports ADD COLUMN kind TEXT NOT NULL DEFAULT 'BAD'")
 
+        if "reporter_hash" not in cols:
+            conn.execute("ALTER TABLE reports ADD COLUMN reporter_hash TEXT")
+
+        if "confidence" not in cols:
+            conn.execute("ALTER TABLE reports ADD COLUMN confidence REAL NOT NULL DEFAULT 0.3")
+
+        if "used_for_training" not in cols:
+            conn.execute("ALTER TABLE reports ADD COLUMN used_for_training INTEGER NOT NULL DEFAULT 0")
+
         conn.commit()

@@ -16,7 +16,7 @@ _PROFANITY_RE = re.compile(
     r"kur\w*|"
     r"p(i|í|i\u0301)?c\w*|pič\w*|pizd\w*|"
     r"sran\w*|govn\w*|"
-    r"mater\w*|"
+    r"mater\w*"
     r")\b",
     re.IGNORECASE | re.UNICODE,
 )
