@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import secrets
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
@@ -26,6 +27,14 @@ from .rules import nonviolent_threat_score, profanity_score, spam_score, threat_
 ALLOW_MAX = 0.35
 PENDING_MIN = 0.35
 DELETE_MIN_DEFAULT = 0.80
+
+PENDING_MIN_BY_LABEL: Dict[str, float] = {
+    "spam": 0.60,
+    "profanity": 0.55,
+    "abuse": 0.60,
+    "hate_speech": 0.70,
+    "threat": 0.50,
+}
 
 # Conservative deletes for weaker categories.
 DELETE_MIN_BY_LABEL: Dict[str, float] = {
@@ -63,6 +72,9 @@ _online: Optional[OnlineLearner] = None
 
 _rate_lock = threading.Lock()
 _rate_state: Dict[str, List[float]] = {}
+
+_training_count_lock = threading.Lock()
+_training_count_cache: Optional[int] = None
 
 
 def _server_salt_path() -> Path:
@@ -130,10 +142,27 @@ def load_online() -> OnlineLearner:
         _online = OnlineLearner.loads(blob)
         return _online
 
-def _training_count() -> int:
+
+def _training_count_db() -> int:
     with connect() as conn:
         row = conn.execute("SELECT COUNT(1) AS n FROM reports WHERE used_for_training=1").fetchone()
         return int(row["n"] if row else 0)
+
+
+def refresh_training_count() -> int:
+    global _training_count_cache
+    n = _training_count_db()
+    with _training_count_lock:
+        _training_count_cache = n
+    return n
+
+
+def get_training_count() -> int:
+    with _training_count_lock:
+        cached = _training_count_cache
+    if cached is not None:
+        return int(cached)
+    return refresh_training_count()
 
 
 def _learned_weight(training_count: int) -> float:
@@ -178,22 +207,30 @@ def insert_report(
     kind_norm = (kind or "BAD").upper()
     labels_json = json.dumps({l: 1 for l in selected}, ensure_ascii=False)
     with connect() as conn:
-        conn.execute(
-            "INSERT INTO reports(comment_id, created_at, kind, labels_json, reporter_hash, confidence, used_for_training, note) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (
-                comment_id,
-                now_iso(),
-                kind_norm,
-                labels_json,
-                (reporter_hash or ""),
-                float(confidence),
-                int(used_for_training),
-                note,
-            ),
-        )
+        try:
+            conn.execute(
+                "INSERT INTO reports(comment_id, created_at, kind, labels_json, reporter_hash, confidence, used_for_training, note) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    comment_id,
+                    now_iso(),
+                    kind_norm,
+                    labels_json,
+                    (reporter_hash or ""),
+                    float(confidence),
+                    int(used_for_training),
+                    note,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # Likely duplicate report due to UNIQUE index; ignore silently.
+            return
+
         conn.execute("UPDATE comments SET report_count = report_count + 1 WHERE id=?", (comment_id,))
         conn.commit()
+
+    if int(used_for_training) == 1:
+        refresh_training_count()
 
 
 def _decide_status(scores: Dict[str, float], *, violent_threat: float) -> str:
@@ -210,7 +247,8 @@ def _decide_status(scores: Dict[str, float], *, violent_threat: float) -> str:
     # Pending zone
     for label in LABELS:
         s = float(scores.get(label, 0.0))
-        if s >= PENDING_MIN:
+        pending_min = float(PENDING_MIN_BY_LABEL.get(label, PENDING_MIN))
+        if s >= pending_min:
             return STATUS_PENDING
 
     return STATUS_APPROVED
@@ -250,20 +288,24 @@ def _maybe_train_from_consensus(
 
         conn.execute(
             "UPDATE reports SET used_for_training=1 "
-            "WHERE comment_id=? AND kind=? AND labels_json=? AND used_for_training=0",
+            "WHERE comment_id=? AND kind=? AND labels_json=? AND used_for_training=0 AND reporter_hash!=''",
             (comment_id, kind_norm, labels_json),
         )
         conn.commit()
 
-        # Weight = sum(max confidence per reporter) to avoid spammy repeats.
+        # Weight grows with #independent reporters (and is capped).
         rows = conn.execute(
             "SELECT reporter_hash, MAX(confidence) AS c "
             "FROM reports WHERE comment_id=? AND kind=? AND labels_json=? AND reporter_hash!='' "
             "GROUP BY reporter_hash",
             (comment_id, kind_norm, labels_json),
         ).fetchall()
-        weight = float(sum(float(r["c"] or 0.0) for r in rows))
+        n_reporters = int(len(rows))
+        sum_conf = float(sum(float(r["c"] or 0.0) for r in rows))
+        weight = float(max(sum_conf, 1.0 + 0.5 * max(0, n_reporters - CONSENSUS_MIN_REPORTERS)))
         weight = float(max(0.1, min(2.0, weight)))
+
+    refresh_training_count()
 
     online = load_online()
     with _model_lock:
@@ -307,6 +349,8 @@ def retrain_from_all_reports() -> int:
         conn.execute("UPDATE training_state SET model_blob=? WHERE id=1", (learner.dumps(),))
         conn.commit()
 
+    refresh_training_count()
+
     global _online
     with _model_lock:
         _online = learner
@@ -320,7 +364,7 @@ def rescore_existing_comments() -> int:
     Returns number of rescored rows.
     """
     learner = load_online()
-    training_count = _training_count()
+    training_count = get_training_count()
     with connect() as conn:
         rows = conn.execute(
             "SELECT id, text, status FROM comments ORDER BY id ASC"
@@ -335,7 +379,8 @@ def rescore_existing_comments() -> int:
         ch = two_channel(text)
 
         baseline = baseline_model.predict(ch.raw)
-        learned = learner.predict_proba(ch.norm)
+        with _model_lock:
+            learned = learner.predict_proba(ch.norm)
         final = combine_scores(baseline, learned, training_count=training_count)
 
         # Hard rule overrides
@@ -383,6 +428,7 @@ def rescore_existing_comments() -> int:
 def _startup() -> None:
     init_db()
     load_online()
+    refresh_training_count()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -424,11 +470,12 @@ def create_comment(text: str = Form(...)) -> RedirectResponse:
         return RedirectResponse(url="/", status_code=303)
 
     ch = two_channel(t)
-    training_count = _training_count()
+    training_count = get_training_count()
 
     baseline = baseline_model.predict(ch.raw)
     online = load_online()
-    learned = online.predict_proba(ch.norm)
+    with _model_lock:
+        learned = online.predict_proba(ch.norm)
     final = combine_scores(baseline, learned, training_count=training_count)
 
     # Hard, uni-project-safe rule overrides: obvious cases should work immediately.
@@ -498,7 +545,7 @@ async def report_comment(comment_id: int, request: Request) -> JSONResponse:
         selected=selected,
         note=note,
         reporter_hash=rep_hash,
-        confidence=0.3,
+        confidence=0.5,
         used_for_training=0,
     )
 

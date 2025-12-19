@@ -35,4 +35,10 @@ def init_db() -> None:
         if "used_for_training" not in cols:
             conn.execute("ALTER TABLE reports ADD COLUMN used_for_training INTEGER NOT NULL DEFAULT 0")
 
+        # Dedupe identical reports by same reporter (reduces spam + poisoning)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_dedupe "
+            "ON reports(comment_id, reporter_hash, kind, labels_json)"
+        )
+
         conn.commit()

@@ -110,7 +110,7 @@ class BaselineModel:
 
         hate_speech = max(bertic_hate, detox["identity_hate"])
         threat = max(detox["threat"], float(threat_score(t)))
-        profanity = max(detox["obscene"], float(profanity_score(t)))
+        profanity = max(float(profanity_score(t)), 0.35 * float(detox["obscene"]))
         # Keep label semantics clean:
         # - profanity: vulgar language
         # - abuse: personal insult / harassment signal (not profanity)
