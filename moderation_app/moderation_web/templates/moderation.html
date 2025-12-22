@@ -19,8 +19,8 @@
     </header>
 
     <section class="stack">
-      <h2 class="sectionTitle">All comments</h2>
-      {% for c in all_comments %}
+      <h2 class="sectionTitle">Approved comments</h2>
+      {% for c in approved_comments %}
         <article class="comment card">
           <div class="comment__meta">
             <div class="muted">#{{ c.id }} · {{ c.created_at }}</div>
@@ -32,21 +32,16 @@
           <div class="comment__footer">
             <div class="badges" data-scores='{{ c.final | tojson }}'></div>
             <div class="row">
-              {% if c.status != 'DELETED' %}
-                <form method="post" action="/moderation/{{ c.id }}/good">
-                  <button class="btn" type="submit">Good (Approve)</button>
-                </form>
-                <button class="btn btn--danger" type="button" data-moderate-bad data-comment-id="{{ c.id }}">Bad (Delete + Train)</button>
-              {% endif %}
+              <button class="btn btn--danger" type="button" data-moderate-bad data-comment-id="{{ c.id }}">Bad (Delete + Train)</button>
             </div>
           </div>
         </article>
       {% else %}
-        <div class="muted">No comments yet.</div>
+        <div class="muted">No approved comments.</div>
       {% endfor %}
     </section>
 
-    <section class="stack" style="margin-top:18px">
+    <section class="stack">
       <h2 class="sectionTitle">Pending review</h2>
       {% for c in pending_comments %}
         <article class="comment card">
@@ -70,7 +65,7 @@
       {% endfor %}
     </section>
 
-    <section class="stack" style="margin-top:18px">
+    <section class="stack">
       <h2 class="sectionTitle">Deleted comments</h2>
       {% for c in deleted_comments %}
         <article class="comment card">

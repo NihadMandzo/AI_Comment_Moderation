@@ -6,7 +6,7 @@ from typing import Dict
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 
-from .rules import abuse_score, profanity_score, spam_score, threat_score
+from moderation_agent.text.heuristics import abuse_score, profanity_score, spam_score, threat_score
 
 
 LABELS = ["hate_speech", "abuse", "threat", "profanity", "spam"]
@@ -21,8 +21,6 @@ class BaselineModel:
         self._toxic_model = None
 
     def _load(self) -> None:
-        # Load lazily so startup is fast-ish and failures don't crash the app.
-        # 1) BERTić fine-tune for hate/offensive signal
         hate_tok = AutoTokenizer.from_pretrained(
             "classla/bcms-bertic-frenk-hate",
             use_fast=False,
@@ -34,7 +32,6 @@ class BaselineModel:
             top_k=None,
         )
 
-        # 2) Unitary multilingual toxicity model with multi-headed labels
         self._toxic_tok = AutoTokenizer.from_pretrained(
             "unitary/multilingual-toxic-xlm-roberta",
             use_fast=False,
@@ -57,7 +54,6 @@ class BaselineModel:
                     self._load()
                 except Exception as e:  # noqa: BLE001
                     print(f"[baseline] WARNING: could not load models: {e}")
-                    # Safe fallback: no baseline toxicity signal
                     return {
                         "hate_speech": 0.0,
                         "abuse": 0.0,
@@ -66,16 +62,13 @@ class BaselineModel:
                         "spam": float(spam_score(t)),
                     }
 
-        # BERTić hate/offensive
         bertic_hate = 0.0
         try:
             out = self._pipe_hate(t)
-            # Pipeline returns list[dict] or list[list[dict]] depending on config.
             items = out[0] if out and isinstance(out[0], list) else out
             for item in items:
                 label = str(item.get("label", "")).lower()
                 score = float(item.get("score", 0.0))
-                # Try common label conventions
                 if "hate" in label or "offen" in label or "toxic" in label:
                     bertic_hate = max(bertic_hate, score)
         except Exception as e:  # noqa: BLE001
@@ -111,9 +104,6 @@ class BaselineModel:
         hate_speech = max(bertic_hate, detox["identity_hate"])
         threat = max(detox["threat"], float(threat_score(t)))
         profanity = max(float(profanity_score(t)), 0.35 * float(detox["obscene"]))
-        # Keep label semantics clean:
-        # - profanity: vulgar language
-        # - abuse: personal insult / harassment signal (not profanity)
         abuse = max(detox["insult"], detox["toxic"], detox["severe_toxic"], float(abuse_score(t)))
         spam = float(spam_score(t))
 

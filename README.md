@@ -29,15 +29,15 @@ cd moderation_app
 py -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+uvicorn moderation_web.main:app --reload
 ```
 
 If port 8000 is blocked on Windows, use:
 ```powershell
-python -m uvicorn --app-dir . app.main:app --reload --host 127.0.0.1 --port 8010
+python -m uvicorn --app-dir . moderation_web.main:app --reload --host 127.0.0.1 --port 8010
 ```
 
-If you see `ModuleNotFoundError: No module named 'app'` with `--reload` on Windows, use the included runner (it sets `PYTHONPATH` for the reload subprocess):
+If you see `ModuleNotFoundError` with `--reload` on Windows, use the included runner (it sets `PYTHONPATH` for the reload subprocess):
 ```powershell
 ./run.ps1
 ```
@@ -48,7 +48,7 @@ cd moderation_app
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+uvicorn moderation_web.main:app --reload
 ```
 
 ## Open
@@ -59,7 +59,7 @@ uvicorn app.main:app --reload
 To quickly seed Bosnian good/bad examples and train the online model:
 ```powershell
 cd moderation_app
-python scripts\seed_bosnian_dataset.py
+python scripts\datasets\seed_bosnian_dataset.py
 ```
 
 You can also train from the UI:
@@ -86,13 +86,16 @@ Privacy note: the app does **not** store raw IP addresses in the DB for reporter
 
 ## Database
 SQLite DB is created automatically on first run.
+DB file location:
+- `moderation_app/data/moderation.db` (and SQLite `-wal`/`-shm` files live next to it)
 Tables:
 - `comments`
 - `reports`
 - `training_state` (single row, persists the online model)
 
 ## Ops knobs
-- `MODERATION_SALT`: optional env var used to hash reporters. If unset, the server creates `app/_server_salt.txt` on first run.
+- `MODERATION_SALT`: optional env var used to hash reporters. If unset, the server creates `moderation_web/_server_salt.txt` on first run.
+
 
 ## Notes
 - For correctness and consistent online learning, run a **single** Uvicorn worker (do not scale workers) unless you also implement shared training_state coordination.

@@ -32,7 +32,6 @@
           <p class="comment__text">{{ c.text }}</p>
 
           <div class="comment__footer">
-            <div class="badges" data-scores='{{ c.final | tojson }}'></div>
             <button class="btn btn--ghost" type="button" data-report-button data-comment-id="{{ c.id }}">Report</button>
           </div>
         </article>

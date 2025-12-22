@@ -1,6 +1,17 @@
 (() => {
   function readLabels() {
     if (Array.isArray(window.APP_LABELS)) return window.APP_LABELS;
+
+    const displayEl = document.getElementById('displayLabelsJson');
+    if (displayEl) {
+      try {
+        const parsed = JSON.parse(displayEl.textContent || '[]');
+        if (Array.isArray(parsed) && parsed.length) return parsed;
+      } catch (_) {
+        // ignore
+      }
+    }
+
     const el = document.getElementById('labelsJson');
     if (!el) return [];
     try {

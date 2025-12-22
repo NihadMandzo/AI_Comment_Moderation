@@ -51,7 +51,6 @@ class OnlineLearner:
         return out
 
     def update(self, text: str, selected_labels: Iterable[str], kind: str = "BAD") -> None:
-    
         self.update_weighted(text, selected_labels, kind=kind, weight=1.0)
 
     def update_weighted(
@@ -71,10 +70,8 @@ class OnlineLearner:
         if kind_norm == "GOOD":
             y = {label: 0 for label in LABELS}
         else:
-            # BAD: treat selected labels as 1, others as 0
             y = {label: int(label in selected) for label in LABELS}
 
-        # partial_fit needs classes on the first call
         if not self.is_initialized:
             for label, clf in self.classifiers.items():
                 clf.partial_fit(

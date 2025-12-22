@@ -7,9 +7,6 @@ from .normalize import normalize_text
 
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 
-# Lightweight BCS profanity heuristic.
-# Purpose: catch common swear-word stems in Bosnian/Croatian/Serbian text.
-# This is intentionally incomplete and should be treated as a heuristic signal.
 _PROFANITY_RE = re.compile(
     r"\b("
     r"jeb\w*|jbt|jebote|"
@@ -20,7 +17,6 @@ _PROFANITY_RE = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
-# Direct personal insults (abuse), kept separate from profanity.
 _ABUSE_RE = re.compile(
     r"\b("
     r"idiot\w*|kreten\w*|budal\w*|deb(il|ila|ilu)\w*|"
@@ -29,14 +25,13 @@ _ABUSE_RE = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
-# Threat rules are split into violent vs non-violent so actions can differ.
 _VIOLENT_THREAT_RE = re.compile(
     r"\b("
-    r"ub(i|í|i\u0301)?(j|cu|ću|ces|ćeš|cete|ćete)?\w*|"  # ubij, ubiću...
-    r"zakla\w*|zaklat\w*|"  # zaklat/zaklaću
-    r"prebi\w*|razbi\w*|"  # prebiću, razbiću
-    r"spali\w*|"  # spalit ću
-    r"silova\w*|"  # silovat
+    r"ub(i|í|i\u0301)?(j|cu|ću|ces|ćeš|cete|ćete)?\w*|"
+    r"zakla\w*|zaklat\w*|"
+    r"prebi\w*|razbi\w*|"
+    r"spali\w*|"
+    r"silova\w*|"
     r"bomba\w*|eksploz\w*|"
     r"puca\w*|upuca\w*|"
     r"noz\w*|pištolj\w*|pistolj\w*"
@@ -58,29 +53,23 @@ _NONVIOLENT_THREAT_RE = re.compile(
 
 
 def spam_score(text: str) -> float:
-    """Heuristic spam score in [0, 1]."""
     t = normalize_text(text)
     if not t:
         return 0.0
 
     score = 0.0
-
-    # Links are a strong signal
     if _URL_RE.search(t):
         score = max(score, 0.75)
 
-    # Excessive repetition (same word many times)
     tokens = re.findall(r"\w+", t.lower(), flags=re.UNICODE)
     if tokens:
         unique_ratio = len(set(tokens)) / max(1, len(tokens))
         if len(tokens) >= 8 and unique_ratio < 0.35:
             score = max(score, 0.7)
 
-    # Too many identical characters in a row (e.g. !!!!!, aaaaa)
     if re.search(r"(.)\1\1\1+", t):
         score = max(score, 0.5)
 
-    # Too many non-word symbols
     non_word = len(re.findall(r"[^\w\s]", t, flags=re.UNICODE))
     if len(t) >= 20 and (non_word / len(t)) > 0.25:
         score = max(score, 0.5)
@@ -89,7 +78,6 @@ def spam_score(text: str) -> float:
 
 
 def profanity_score(text: str) -> float:
-    """Heuristic profanity score in [0, 1] for BCS languages."""
     t = normalize_text(text)
     if not t:
         return 0.0
@@ -97,8 +85,6 @@ def profanity_score(text: str) -> float:
     matches = list(_PROFANITY_RE.finditer(t))
     if not matches:
         return 0.0
-
-    # One match is already strong; multiple matches saturate.
     if len(matches) == 1:
         return 0.85
     if len(matches) == 2:
@@ -107,7 +93,6 @@ def profanity_score(text: str) -> float:
 
 
 def abuse_score(text: str) -> float:
-    """Heuristic abuse (personal insult) score in [0, 1] for BCS languages."""
     t = normalize_text(text)
     if not t:
         return 0.0
@@ -117,7 +102,6 @@ def abuse_score(text: str) -> float:
 
 
 def violent_threat_score(text: str) -> float:
-    """Heuristic violent threat score in [0, 1] for BCS languages."""
     t = normalize_text(text)
     if not t:
         return 0.0
@@ -127,7 +111,6 @@ def violent_threat_score(text: str) -> float:
 
 
 def nonviolent_threat_score(text: str) -> float:
-    """Heuristic non-violent threat score in [0, 1] for BCS languages."""
     t = normalize_text(text)
     if not t:
         return 0.0
@@ -137,5 +120,4 @@ def nonviolent_threat_score(text: str) -> float:
 
 
 def threat_score(text: str) -> float:
-    """Backwards-compatible: max of violent + non-violent threats."""
     return float(max(violent_threat_score(text), nonviolent_threat_score(text)))
