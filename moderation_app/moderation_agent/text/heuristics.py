@@ -53,12 +53,15 @@ _NONVIOLENT_THREAT_RE = re.compile(
 
 
 def spam_score(text: str) -> float:
-    t = normalize_text(text)
-    if not t:
+    raw = (text or "").strip()
+    t = normalize_text(raw)
+    if not raw and not t:
         return 0.0
 
     score = 0.0
-    if _URL_RE.search(t):
+    # IMPORTANT: detect URLs on raw text, not normalized text.
+    # normalize_text() removes punctuation ('.', '/', ':') which breaks URL patterns.
+    if _URL_RE.search(raw):
         score = max(score, 0.75)
 
     tokens = re.findall(r"\w+", t.lower(), flags=re.UNICODE)
